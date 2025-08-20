@@ -1,16 +1,21 @@
+"""
+Improved Voice AI Agent with better async/threading handling
+"""
+
 import asyncio
 import websockets
 import json
 import base64
 import pyaudio
 import threading
+import queue
 from typing import Dict, List, Callable, Any
 import os
 from dotenv import load_dotenv
 
 load_dotenv()
 
-class VoiceAIAgent:
+class VoiceAIAgentImproved:
     def __init__(self):
         self.api_key = os.getenv("OPENAI_API_KEY")
         if not self.api_key:
@@ -27,6 +32,9 @@ class VoiceAIAgent:
         self.rate = 24000
         self.chunk = 1024
         
+        # Audio queue for thread-safe communication
+        self.audio_queue = queue.Queue()
+        
         # Function registry for HRI commands
         self.functions: Dict[str, Callable] = {}
         self.function_schemas: List[Dict] = []
@@ -35,6 +43,7 @@ class VoiceAIAgent:
         """Register a function that can be called by the AI agent"""
         self.functions[name] = func
         self.function_schemas.append({
+            "type": "function",
             "name": name,
             "description": schema.get("description", ""),
             "parameters": schema.get("parameters", {})
@@ -59,7 +68,36 @@ class VoiceAIAgent:
             "type": "session.update",
             "session": {
                 "modalities": ["text", "audio"],
-                "instructions": "You are a helpful AI assistant for human-robot interaction. Use the available functions to control robot actions when requested.",
+                "instructions": """You are an intelligent cafe service robot with voice interaction capabilities. 
+
+CORE CAPABILITIES:
+1. CAFE ORDERING: Help customers browse menu, place orders, customize items, process payments
+2. ROBOT CONTROL: Move around, control LEDs, take photos, scan environment
+3. CUSTOMER SERVICE: Provide recommendations, check order status, handle modifications
+
+CONVERSATION GUIDELINES:
+- Always be friendly, helpful, and professional
+- For ordering: Guide customers through menu, suggest items, confirm details
+- For robot control: Confirm movements for safety, explain actions
+- Use appropriate functions based on customer requests
+- Ask clarifying questions when needed
+- Provide clear status updates
+
+ORDERING FLOW:
+1. Greet customer and offer menu/recommendations
+2. Help browse menu by category if needed
+3. Add items with customizations
+4. Confirm order details and total
+5. Process payment
+6. Provide order status and estimated time
+
+ROBOT ACTIONS:
+- Always confirm before moving
+- Explain what you're doing
+- Report status when asked
+- Use LEDs and sounds for better interaction
+
+Be conversational and natural - you're both a helpful cafe assistant and a capable service robot!""",
                 "voice": "alloy",
                 "input_audio_format": "pcm16",
                 "output_audio_format": "pcm16",
@@ -87,6 +125,21 @@ class VoiceAIAgent:
             }
             await self.ws.send(json.dumps(audio_message))
             
+    async def process_audio_queue(self):
+        """Process audio data from the queue"""
+        while True:
+            try:
+                # Non-blocking queue check
+                audio_data = self.audio_queue.get_nowait()
+                await self.send_audio_chunk(audio_data)
+                self.audio_queue.task_done()
+            except queue.Empty:
+                # No audio data, wait a bit
+                await asyncio.sleep(0.01)
+            except Exception as e:
+                print(f"Audio queue error: {e}")
+                await asyncio.sleep(0.1)
+                
     async def handle_messages(self):
         """Handle incoming messages from the API"""
         async for message in self.ws:
@@ -108,10 +161,16 @@ class VoiceAIAgent:
                 await self.handle_function_call(data)
                 
         elif msg_type == "response.done":
-            print("Response completed")
+            print("🔄 Response completed")
             
         elif msg_type == "error":
-            print(f"Error: {data}")
+            print(f"❌ Error: {data}")
+            
+        elif msg_type == "session.created":
+            print("✅ Session created successfully")
+            
+        elif msg_type == "session.updated":
+            print("✅ Session configured")
             
     async def handle_function_call(self, data: Dict):
         """Execute function calls from the AI"""
@@ -121,7 +180,9 @@ class VoiceAIAgent:
         try:
             args = json.loads(arguments)
             if function_name in self.functions:
+                print(f"\n🔧 Executing: {function_name}({args})")
                 result = await self.functions[function_name](**args)
+                print(f"📋 Result: {result}")
                 
                 # Send function result back
                 response = {
@@ -142,69 +203,91 @@ class VoiceAIAgent:
         self.is_recording = True
         
         def record():
-            stream = self.audio.open(
-                format=self.format,
-                channels=self.channels,
-                rate=self.rate,
-                input=True,
-                frames_per_buffer=self.chunk
-            )
-            
-            while self.is_recording:
-                data = stream.read(self.chunk)
-                if self.ws:
-                    # Use thread-safe method to schedule coroutine
+            stream = None
+            try:
+                stream = self.audio.open(
+                    format=self.format,
+                    channels=self.channels,
+                    rate=self.rate,
+                    input=True,
+                    frames_per_buffer=self.chunk
+                )
+                
+                print("🎤 Recording started - speak now!")
+                
+                while self.is_recording:
                     try:
-                        loop = asyncio.get_event_loop()
-                        if loop.is_running():
-                            loop.call_soon_threadsafe(
-                                lambda: asyncio.create_task(self.send_audio_chunk(data))
-                            )
-                    except RuntimeError:
-                        # No event loop running, skip this chunk
-                        pass
-                    
-            stream.stop_stream()
-            stream.close()
+                        data = stream.read(self.chunk, exception_on_overflow=False)
+                        # Put audio data in queue for async processing
+                        self.audio_queue.put(data)
+                    except Exception as e:
+                        print(f"Recording error: {e}")
+                        break
+                        
+            except Exception as e:
+                print(f"Audio setup error: {e}")
+            finally:
+                if stream:
+                    stream.stop_stream()
+                    stream.close()
+                print("🎤 Recording stopped")
             
-        self.record_thread = threading.Thread(target=record)
+        self.record_thread = threading.Thread(target=record, daemon=True)
         self.record_thread.start()
         
     def stop_recording(self):
         """Stop recording audio"""
         self.is_recording = False
         if hasattr(self, 'record_thread'):
-            self.record_thread.join()
+            self.record_thread.join(timeout=2.0)
             
     async def play_audio(self, audio_data: bytes):
         """Play audio data through speakers"""
         def play():
-            stream = self.audio.open(
-                format=self.format,
-                channels=self.channels,
-                rate=self.rate,
-                output=True
-            )
-            
-            stream.write(audio_data)
-            stream.stop_stream()
-            stream.close()
-            
-        threading.Thread(target=play).start()
+            try:
+                stream = self.audio.open(
+                    format=self.format,
+                    channels=self.channels,
+                    rate=self.rate,
+                    output=True
+                )
+                
+                stream.write(audio_data)
+                stream.stop_stream()
+                stream.close()
+            except Exception as e:
+                print(f"Audio playback error: {e}")
+                
+        threading.Thread(target=play, daemon=True).start()
         
     async def run(self):
         """Main loop for the voice agent"""
-        await self.connect()
-        
-        # Start recording
-        self.start_recording()
-        
         try:
+            print("🔗 Connecting to OpenAI Realtime API...")
+            await self.connect()
+            
+            # Start recording
+            self.start_recording()
+            
+            # Start audio queue processor
+            audio_task = asyncio.create_task(self.process_audio_queue())
+            
+            print("\n🎉 Voice AI Cafe Robot is ready!")
+            print("🎤 Speak naturally - I can help with cafe orders and robot control!")
+            print("💡 Try saying: 'Hello, show me the menu' or 'Move forward 2 meters'")
+            print("⏹️  Press Ctrl+C to stop\n")
+            
+            # Handle messages
             await self.handle_messages()
+            
         except websockets.exceptions.ConnectionClosed:
-            print("Connection closed")
+            print("🔌 Connection closed")
+        except KeyboardInterrupt:
+            print("\n👋 Stopped by user")
         finally:
             self.stop_recording()
+            if 'audio_task' in locals():
+                audio_task.cancel()
             
     def cleanup(self):
         """Clean up resources"""
