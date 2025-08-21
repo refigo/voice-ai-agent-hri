@@ -12,6 +12,7 @@ import argparse
 from unified_voice_agent import UnifiedVoiceAgent
 from hri_functions import RobotController, HRI_FUNCTION_SCHEMAS
 from cafe_system import CafeKioskSystem, CAFE_FUNCTION_SCHEMAS
+from kiosk_ui import KioskUIController, KIOSK_UI_FUNCTION_SCHEMAS
 
 class UnifiedCafeRobotSystem:
     """Unified system combining cafe ordering and robot control"""
@@ -20,6 +21,7 @@ class UnifiedCafeRobotSystem:
         # Initialize subsystems
         self.cafe_system = CafeKioskSystem()
         self.robot = RobotController()
+        self.kiosk_ui = KioskUIController(self.cafe_system)
         
         # Initialize voice agent
         audio_enabled = mode in ["auto", "voice"]
@@ -53,6 +55,12 @@ class UnifiedCafeRobotSystem:
             func = getattr(self.robot, func_name)
             self.agent.register_function(func_name, func, schema)
             
+        # Register kiosk UI functions
+        for schema in KIOSK_UI_FUNCTION_SCHEMAS:
+            func_name = schema["name"]
+            func = getattr(self.kiosk_ui, func_name)
+            self.agent.register_function(func_name, func, schema)
+            
         # Register system management functions
         self.agent.register_function("get_system_status", self.get_system_status, {
             "name": "get_system_status",
@@ -78,6 +86,7 @@ class UnifiedCafeRobotSystem:
         
         print(f"✅ Registered {len(CAFE_FUNCTION_SCHEMAS)} cafe functions")
         print(f"✅ Registered {len(HRI_FUNCTION_SCHEMAS)} robot functions")
+        print(f"✅ Registered {len(KIOSK_UI_FUNCTION_SCHEMAS)} kiosk UI functions")
         print("✅ Registered 2 system management functions")
         
     async def get_system_status(self) -> str:
@@ -95,6 +104,11 @@ class UnifiedCafeRobotSystem:
                 "active_order": bool(self.cafe_system.current_order),
                 "orders_completed": len(self.cafe_system.order_history)
             },
+            "kiosk": {
+                "current_screen": self.kiosk_ui.current_state.value,
+                "highlighted_item": self.kiosk_ui.highlighted_index,
+                "current_category": self.kiosk_ui.current_category or "none"
+            },
             "conversation": {
                 "mode": self.conversation_context["mode"],
                 "interactions": self.conversation_context["interaction_count"],
@@ -109,6 +123,7 @@ class UnifiedCafeRobotSystem:
         return f"🤖 **SYSTEM STATUS**\n\n" + \
                f"**Robot:** Position {status['robot']['position']}, Battery {status['robot']['battery']}\n" + \
                f"**Cafe:** {status['cafe']['total_menu_items']} menu items, {status['cafe']['orders_completed']} orders completed\n" + \
+               f"**Kiosk:** {status['kiosk']['current_screen']} screen, item {status['kiosk']['highlighted_item']}\n" + \
                f"**Mode:** {status['conversation']['mode'].title()}, {status['conversation']['interactions']} interactions\n" + \
                f"**Input:** {status['system']['input_mode'].title()} mode"
         
@@ -134,6 +149,7 @@ class UnifiedCafeRobotSystem:
             print(f"\n🛑 Received signal {signum}")
             print("Shutting down unified system...")
             self.running = False
+            exit(0)
             
         signal.signal(signal.SIGINT, signal_handler)
         signal.signal(signal.SIGTERM, signal_handler)
@@ -166,11 +182,18 @@ class UnifiedCafeRobotSystem:
         print("  • 'What's your current status and battery level?'")
         print("  • 'Scan the environment and report what you see'")
         
+        print("\n🖥️  KIOSK UI CONTROL:")
+        print("  • 'Show the menu on the screen'")
+        print("  • 'Highlight the americano on the display'")
+        print("  • 'Display my cart contents'")
+        print("  • 'Navigate to the coffee category'")
+        print("  • 'Show checkout screen'")
+        
         print("\n🔄 COMBINED INTERACTIONS:")
-        print("  • 'Take my order then deliver it to table 5'")
-        print("  • 'Show me the menu while you move to the counter'")
-        print("  • 'After I pay, guide me to the pickup area'")
-        print("  • 'Switch to robot mode and patrol the cafe'")
+        print("  • 'Show me the coffee menu on screen and recommend something'")
+        print("  • 'Highlight the latte while you move to prepare it'")
+        print("  • 'Display my cart and then move to the pickup area'")
+        print("  • 'Show welcome screen and patrol the cafe'")
         
     def check_environment(self):
         """Check environment setup"""
