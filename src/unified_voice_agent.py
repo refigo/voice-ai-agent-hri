@@ -9,7 +9,6 @@ import websockets
 import json
 import threading
 import time
-import queue
 from typing import Dict, List, Callable, Any, Optional
 import os
 from dotenv import load_dotenv
@@ -39,7 +38,6 @@ class UnifiedVoiceAgent:
         self.current_response_id = None
         self.audio_queue = asyncio.Queue() if audio_enabled else None
         self.interruption_enabled = True
-        self.message_queue = queue.Queue()
         
         if self.audio_enabled:
             try:
@@ -97,60 +95,36 @@ class UnifiedVoiceAgent:
         self.interruption_enabled = False
         print("⚠️  Voice interruption disabled")
         
-    def connect(self):
+    async def connect(self):
         """Connect to OpenAI Realtime API"""
-        from websocket import WebSocketApp
+        uri = "wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview-2024-10-01"
+        headers = {
+            "Authorization": f"Bearer {self.api_key}",
+            "OpenAI-Beta": "realtime=v1"
+        }
         
-        uri = "wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview-2024-12-17"
-        headers = [
-            f"Authorization: Bearer {self.api_key}",
-            "OpenAI-Beta: realtime=v1"
-        ]
+        header_list = [(key, value) for key, value in headers.items()]
+        self.ws = await websockets.connect(uri, additional_headers=header_list)
         
-        def on_open(ws):
-            print("✅ Connected to OpenAI Realtime API")
-            # Queue session update message
-            self.message_queue.put({"type": "session_update"})
-        
-        def on_message(ws, message):
-            data = json.loads(message)
-            print("Received message:", data)
-            # Queue the message for processing
-            self.message_queue.put(data)
-        
-        def on_error(ws, error):
-            print(f"❌ WebSocket error: {error}")
-        
-        def on_close(ws, close_status_code, close_msg):
-            print("🔌 Connection closed")
-        
-        self.ws = WebSocketApp(
-            uri,
-            header=headers,
-            on_open=on_open,
-            on_message=on_message,
-            on_error=on_error,
-            on_close=on_close
-        )
-        
-        # Start connection in a separate thread
-        import threading
-        self.ws_thread = threading.Thread(target=self.ws.run_forever, daemon=True)
-        self.ws_thread.start()
+        await self.send_session_update()
         
     async def send_session_update(self):
         """Configure the session with tools and settings"""
         modalities = ["text", "audio"] if self.audio_enabled else ["text"]
         
-        # Build session config conditionally
-        session_data = {
-            "modalities": modalities,
-            "instructions": """You are an intelligent cafe service robot with conversational AI capabilities, voice interruption support, and kiosk UI control.
+        session_config = {
+            "type": "session.update",
+            "session": {
+                "modalities": modalities,
+                "instructions": """You are an intelligent cafe service robot with conversational AI capabilities, voice interruption support, and kiosk UI control.
 
 CORE CAPABILITIES:
 1. CAFE ORDERING: Help customers browse menu, place orders, customize items, process payments
 2. ROBOT CONTROL: Move around, control LEDs, take photos, scan environment  
 3. KIOSK UI CONTROL: Display menus, highlight items, navigate screens, show cart contents
+4. CUSTOMER SERVICE: Provide recommendations, check order status, handle modifications
+
+CONVERSATION GUIDELINES:
 - Always be friendly, helpful, and professional
 - Support natural conversation flow with voice interruptions
 - Keep responses concise to allow for interruptions
@@ -168,13 +142,16 @@ VOICE INTERACTION:
 
 ORDERING FLOW:
 1. Greet customer and offer menu/recommendations
-2. Take order with customizations
-3. Confirm order details and total
-4. Process payment
-5. Provide order status and pickup info
+2. Help browse menu by category if needed
+3. Add items with customizations
+4. Confirm order details and total
+5. Process payment
+6. Provide order status and estimated time
 
 ROBOT ACTIONS:
-- Move safely and announce movements
+- Always confirm before moving
+- Explain what you're doing
+- Report status when asked
 - Use LEDs and sounds for better interaction
 
 KIOSK UI ACTIONS:
@@ -185,31 +162,23 @@ KIOSK UI ACTIONS:
 - Use visual feedback to enhance conversation
 
 Be conversational and natural - you're both a helpful cafe assistant and a capable service robot that supports dynamic voice interaction with visual kiosk displays!""",
-            "tools": self.function_schemas
-        }
-        
-        # Add audio-specific settings only if audio is enabled
-        if self.audio_enabled:
-            session_data.update({
                 "voice": "alloy",
-                "input_audio_format": "pcm16",
-                "output_audio_format": "pcm16",
-                "input_audio_transcription": {"model": "whisper-1"},
+                "input_audio_format": "pcm16" if self.audio_enabled else None,
+                "output_audio_format": "pcm16" if self.audio_enabled else None,
+                "input_audio_transcription": {
+                    "model": "whisper-1"
+                } if self.audio_enabled else None,
                 "turn_detection": {
                     "type": "server_vad",
-                    "threshold": 0.3,
-                    "prefix_padding_ms": 200,
-                    "silence_duration_ms": 150
-                }
-            })
-        
-        session_config = {
-            "type": "session.update",
-            "session": session_data
+                    "threshold": 0.3,  # Lower threshold for more sensitive interruption detection
+                    "prefix_padding_ms": 200,  # Reduced padding for faster response
+                    "silence_duration_ms": 150  # Shorter silence for quicker interruption
+                } if self.audio_enabled else None,
+                "tools": self.function_schemas
+            }
         }
         
-        if self.ws:
-            self.ws.send(json.dumps(session_config))
+        await self.ws.send(json.dumps(session_config))
         
     async def send_text_message(self, text: str):
         """Send text message to the API"""
@@ -222,11 +191,11 @@ Be conversational and natural - you're both a helpful cafe assistant and a capab
                     "content": [{"type": "text", "text": text}]
                 }
             }
-            self.ws.send(json.dumps(message))
+            await self.ws.send(json.dumps(message))
             
             # Trigger response
             response_trigger = {"type": "response.create"}
-            self.ws.send(json.dumps(response_trigger))
+            await self.ws.send(json.dumps(response_trigger))
             
     async def send_audio_data(self, audio_data: bytes):
         """Send audio data to the API"""
@@ -236,7 +205,7 @@ Be conversational and natural - you're both a helpful cafe assistant and a capab
                 "type": "input_audio_buffer.append",
                 "audio": base64.b64encode(audio_data).decode()
             }
-            self.ws.send(json.dumps(audio_message))
+            await self.ws.send(json.dumps(audio_message))
             
     async def cancel_response(self):
         """Cancel current AI response for interruption"""
@@ -244,7 +213,7 @@ Be conversational and natural - you're both a helpful cafe assistant and a capab
             cancel_message = {
                 "type": "response.cancel"
             }
-            self.ws.send(json.dumps(cancel_message))
+            await self.ws.send(json.dumps(cancel_message))
             print("\n⏸️  Response cancelled due to interruption")
             
     async def clear_audio_output_buffer(self):
@@ -270,26 +239,14 @@ Be conversational and natural - you're both a helpful cafe assistant and a capab
             commit_message = {
                 "type": "input_audio_buffer.commit"
             }
-            self.ws.send(json.dumps(commit_message))
+            await self.ws.send(json.dumps(commit_message))
             
     async def handle_messages(self):
         """Handle incoming messages from the API"""
-        while self.running:
-            try:
-                # Process messages from the queue
-                try:
-                    message = self.message_queue.get_nowait()
-                    if message.get("type") == "session_update":
-                        await self.send_session_update()
-                    else:
-                        await self.process_message(message)
-                    self.message_queue.task_done()
-                except queue.Empty:
-                    await asyncio.sleep(0.1)
-            except Exception as e:
-                print(f"Message handling error: {e}")
-                break
-                
+        async for message in self.ws:
+            data = json.loads(message)
+            await self.process_message(data)
+            
     async def process_message(self, data: Dict):
         """Process different types of messages from the API"""
         msg_type = data.get("type")
@@ -319,27 +276,6 @@ Be conversational and natural - you're both a helpful cafe assistant and a capab
             if data.get("delta"):
                 await self.handle_function_call(data)
                 
-        elif msg_type == "response.function_call_arguments.delta":
-            # Handle function call arguments delta
-            print("🔧 Function call in progress...", end="", flush=True)
-            
-        elif msg_type == "response.function_call_arguments.done":
-            # Function call arguments completed
-            if data.get("name") and data.get("arguments"):
-                await self.handle_function_call_complete(data)
-                
-        elif msg_type == "response.output_item.added":
-            # New output item added to response
-            item = data.get("item", {})
-            if item.get("type") == "function_call":
-                print(f"\n🔧 Function call: {item.get('name', 'unknown')}")
-                
-        elif msg_type == "response.output_item.done":
-            # Output item completed
-            item = data.get("item", {})
-            if item.get("type") == "function_call":
-                print("✅ Function call completed")
-                
         elif msg_type == "response.done":
             self.is_speaking = False
             self.current_response_id = None
@@ -365,9 +301,8 @@ Be conversational and natural - you're both a helpful cafe assistant and a capab
             
         elif msg_type == "input_audio_buffer.committed":
             # Buffer committed, trigger new response
-            if self.ws:
-                response_trigger = {"type": "response.create"}
-                self.ws.send(json.dumps(response_trigger))
+            response_trigger = {"type": "response.create"}
+            await self.ws.send(json.dumps(response_trigger))
             
         elif msg_type == "conversation.item.created":
             # New conversation item created (user speech transcribed)
@@ -376,18 +311,6 @@ Be conversational and natural - you're both a helpful cafe assistant and a capab
                 if content and content[0].get("type") == "input_text":
                     transcript = content[0].get("text", "")
                     print(f"👤 You said: {transcript}")
-                    
-        elif msg_type == "conversation.item.input_audio_transcription.delta":
-            # Real-time transcription delta
-            delta = data.get("delta", "")
-            if delta:
-                print(delta, end="", flush=True)
-                
-        elif msg_type == "conversation.item.input_audio_transcription.completed":
-            # Transcription completed
-            transcript = data.get("transcript", "")
-            if transcript:
-                print(f"\n👤 You said: {transcript}")
             
         elif msg_type == "error":
             print(f"\n❌ Error: {data}")
@@ -417,7 +340,7 @@ Be conversational and natural - you're both a helpful cafe assistant and a capab
                         "output": str(result)
                     }
                 }
-                self.ws.send(json.dumps(response))
+                await self.ws.send(json.dumps(response))
                 
         except Exception as e:
             print(f"❌ Function call error: {e}")
@@ -429,43 +352,7 @@ Be conversational and natural - you're both a helpful cafe assistant and a capab
                     "output": f"Error: {str(e)}"
                 }
             }
-            self.ws.send(json.dumps(error_response))
-            
-    async def handle_function_call_complete(self, data: Dict):
-        """Handle completed function call with arguments"""
-        function_name = data.get("name")
-        arguments = data.get("arguments", "{}")
-        call_id = data.get("call_id")
-        
-        try:
-            args = json.loads(arguments)
-            if function_name in self.functions:
-                print(f"\n🔧 Executing: {function_name}({args})")
-                result = await self.functions[function_name](**args)
-                print(f"📋 Result: {result}")
-                
-                # Send function result back
-                response = {
-                    "type": "conversation.item.create",
-                    "item": {
-                        "type": "function_call_output",
-                        "call_id": call_id,
-                        "output": str(result)
-                    }
-                }
-                self.ws.send(json.dumps(response))
-                
-        except Exception as e:
-            print(f"❌ Function call error: {e}")
-            error_response = {
-                "type": "conversation.item.create",
-                "item": {
-                    "type": "function_call_output",
-                    "call_id": call_id,
-                    "output": f"Error: {str(e)}"
-                }
-            }
-            self.ws.send(json.dumps(error_response))
+            await self.ws.send(json.dumps(error_response))
             
     async def audio_input_loop(self):
         """Capture and send audio input"""
@@ -514,7 +401,7 @@ Be conversational and natural - you're both a helpful cafe assistant and a capab
         Args:
             mode: "voice", "text", or "auto" (auto-detect based on audio availability)
         """
-        self.connect()
+        await self.connect()
         
         # Determine input mode
         if mode == "auto":
@@ -556,9 +443,7 @@ Be conversational and natural - you're both a helpful cafe assistant and a capab
     def cleanup(self):
         """Clean up resources"""
         self.running = False
-        self.ws = None
-        self.ws_thread = None
-        self.message_queue = queue.Queue()
+        
         if self.audio_enabled:
             if self.audio_in:
                 self.audio_in.stop_stream()

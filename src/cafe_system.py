@@ -396,7 +396,6 @@ class CafeKioskSystem:
 # Function schemas for the cafe kiosk system
 CAFE_FUNCTION_SCHEMAS = [
     {
-        "type": "function",
         "name": "get_menu_by_category",
         "description": "Show menu items by category (coffee, cold_drinks, pastries, sandwiches, or all)",
         "parameters": {
